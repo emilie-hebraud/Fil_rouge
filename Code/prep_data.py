@@ -21,7 +21,7 @@ def raw_data(PATH, folder_path, folder_name, overwrite=True):
         os.remove(result_path)
     first_write = not os.path.exists(result_path)
 
-    for file_path in glob.glob(os.path.join(path, "*.fsa")):
+    for file_path in glob.glob(os.path.join(folder_path, "*.fsa")):
         record = SeqIO.read(file_path, "abi")
         filename = os.path.basename(file_path)
         print("Read :", filename)
@@ -57,7 +57,13 @@ def raw_data(PATH, folder_path, folder_name, overwrite=True):
 
 
 # Raw data (df) into a Raw data (dictionnary of df)
-def prep_tsfresh(ROOT, filename, write_tsfresh=True, tsfresh_filename=None):
+def prep_tsfresh(
+    ROOT,
+    filename,
+    write_tsfresh=True,
+    tsfresh_filename=None,
+    save_raw_dict=False,
+):
     """
     Lit le CSV en chunks et retourne un dictionnaire `raw_dict` mappant
     `filename` -> DataFrame (colonnes: channels).
@@ -65,6 +71,9 @@ def prep_tsfresh(ROOT, filename, write_tsfresh=True, tsfresh_filename=None):
     Si `write_tsfresh` est True, convertit aussi en format long compatible tsfresh
     en flux (streaming) et écrit progressivement dans un fichier CSV sans charger
     l'ensemble en mémoire.
+
+    Si `save_raw_dict` est True, sérialise également le dictionnaire `raw_dict`
+    en un fichier pickle (par défaut: `<base>_raw_dict.pkl` à côté des CSV).
 
     Retourne: (raw_dict, tsfresh_csv_path | None)
     """
@@ -84,6 +93,15 @@ def prep_tsfresh(ROOT, filename, write_tsfresh=True, tsfresh_filename=None):
         if os.path.exists(tsfresh_path):
             os.remove(tsfresh_path)
 
+    # Préparer le chemin de sauvegarde pour le dictionnaire brut si demandé
+    raw_dict_path = None
+    if save_raw_dict:
+        base, ext = os.path.splitext(filename)
+        raw_dict_filename = f"{base}_dict.pkl"
+        raw_dict_path = os.path.join(DATA, raw_dict_filename)
+        if os.path.exists(raw_dict_path):
+            os.remove(raw_dict_path)
+
     raw_dict = {}
     # Suivi de l'offset temporel par fichier pour un index "time" continu
     time_offsets = {}
@@ -97,7 +115,7 @@ def prep_tsfresh(ROOT, filename, write_tsfresh=True, tsfresh_filename=None):
                 raw_dict[name] = df.copy()
             else:
                 raw_dict[name] = pd.concat([raw_dict[name], df], ignore_index=True)
-
+            
             # Ecriture en flux du format long tsfresh
             if write_tsfresh:
                 start = time_offsets.get(name, 0)
@@ -120,12 +138,23 @@ def prep_tsfresh(ROOT, filename, write_tsfresh=True, tsfresh_filename=None):
                     )
                     header_written = True
 
+    # Sauvegarde du dictionnaire brut sur disque si demandé
+    if save_raw_dict:
+        pd.to_pickle(raw_dict, raw_dict_path)
+
     return raw_dict, tsfresh_path
 
-# filename = "M2_raw.csv"
-# prep_tsfresh(ROOT, filename, write_tsfresh=True)
+#filename = "M1_raw.csv"
+#prep_tsfresh(ROOT,filename,write_tsfresh=False,tsfresh_filename=None,save_raw_dict=True)
 
-def build_labels_stream(ROOT, files, output_filename="labels_stream.csv", chunksize=5000, overwrite=True):
+def build_labels_stream(
+        ROOT,
+        files,
+        output_filename,
+        raw_folder,
+        chunksize=5000,
+        overwrite=True
+):
     """
     Écrit un fichier de sortie agrégé (colonnes: plant_number, channel, Y1, Y2)
     en mode streaming par chunks pour éviter la saturation mémoire.
@@ -136,8 +165,15 @@ def build_labels_stream(ROOT, files, output_filename="labels_stream.csv", chunks
     - output_filename: nom du fichier CSV de sortie sous Data
     - chunksize: taille des chunks pour la lecture pandas
     - overwrite: si True, supprime le fichier de sortie existant
+        - raw_folder: dossier des fichiers bruts (.fsa) pour mapper le rang (plant_number)
+            vers le nom de fichier correspondant, selon l'ordre des fichiers du dossier.
 
-    Retourne: chemin absolu du fichier de sortie.
+        Retourne: chemin absolu du fichier de sortie.
+
+        Remarque:
+        - Remplace la colonne "plant" par "filename" qui contient le nom
+            du fichier .fsa correspondant (ordre déterminé par le tri alphanumérique
+            des fichiers du dossier `raw_folder`).
     """
     DATA = os.path.join(ROOT, "..", "Data/label")
     DATA = os.path.normpath(DATA)
@@ -145,6 +181,13 @@ def build_labels_stream(ROOT, files, output_filename="labels_stream.csv", chunks
 
     if overwrite and os.path.exists(output_path):
         os.remove(output_path)
+
+    # Construire le mapping rang -> nom de fichier .fsa depuis le dossier brut
+    raw_dir = os.path.normpath(os.path.join(ROOT, "..", "Data", raw_folder))
+    fsa_paths = sorted(glob.glob(os.path.join(raw_dir, "*.fsa")))
+    fsa_names = [os.path.basename(p) for p in fsa_paths]
+    # Mapping 1-based (1 -> premier fichier, 2 -> deuxième, ...)
+    index_to_filename = {i + 1: name for i, name in enumerate(fsa_names)}
 
     header_written = False
     for rel_path in files:
@@ -164,14 +207,16 @@ def build_labels_stream(ROOT, files, output_filename="labels_stream.csv", chunks
             chunk = chunk.rename(columns={
                 "markA.1": "Y1",
                 "markA.2": "Y2",
-                "plant": "plant_number",
             })
             chunk["channel"] = channel_name
 
-            out = chunk[["plant_number", "channel", "Y1", "Y2"]].copy()
-            out["plant_number"] = pd.to_numeric(out["plant_number"], errors="coerce").astype("Int64")
-            out["Y1"] = pd.to_numeric(out["Y1"], errors="coerce")
-            out["Y2"] = pd.to_numeric(out["Y2"], errors="coerce")
+            # Construire directement la sortie avec filename mappé (en une fois)
+            out = pd.DataFrame({
+                "filename": pd.to_numeric(chunk["plant"], errors="coerce").astype("Int64").map(index_to_filename),
+                "channel": chunk["channel"],
+                "Y1": pd.to_numeric(chunk["Y1"], errors="coerce"),
+                "Y2": pd.to_numeric(chunk["Y2"], errors="coerce"),
+            })
 
             out.to_csv(
                 output_path,
@@ -184,11 +229,13 @@ def build_labels_stream(ROOT, files, output_filename="labels_stream.csv", chunks
 
     return output_path
 
-files = ["M2/channel_1.csv", "M2/channel_2.csv", "M2/channel_3.csv", "M2/channel_4.csv"]
-build_labels_stream(ROOT, files, output_filename="M2_labels_stream.csv")
+#files = ["M2/channel_1.csv", "M2/channel_2.csv", "M2/channel_3.csv", "M2/channel_4.csv"]
+#build_labels_stream(ROOT, files, output_filename="M2_labels_stream.csv", raw_folder= folder_M2)
 
 """
-def split_dataset(ROOT, data, label):
+def split_dataset(ROOT,tsfresh_df, label, merge=True):
+    if merge:
+        
     X_train, X_test, y_train, y_test = train_test_split(data, label, random_state=20240707)
 def get_signal(raw_dict, filename, channel):
     if filename not in raw_dict:
@@ -209,5 +256,4 @@ def get_signal(raw_dict, filename, channel):
     DATA = os.path.normpath(DATA)
     PATH = os.path.join(DATA, folder_path)
 # argpase
-
 """
