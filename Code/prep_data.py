@@ -1,20 +1,16 @@
 import os
 from Bio import SeqIO
 import pandas as pd
+import numpy as np
 import glob
 import argparse
 import sklearn
 from sklearn.model_selection import train_test_split
 import tsfresh
-# tsfresh imports are optional; handled in helper function
-
-try:
-    from tsfresh import extract_features, select_features
-    from tsfresh.utilities.dataframe_functions import impute
-except Exception:
-    extract_features = None
-    select_features = None
-    impute = None
+from tqdm import tqdm
+from collections import defaultdict
+from tsfresh import extract_features, select_features
+from tsfresh.utilities.dataframe_functions import impute
 from tsfresh import extract_relevant_features
 
 # set root of the python file
@@ -221,7 +217,7 @@ def build_labels_stream(
 
             # Construire directement la sortie avec filename mappé (en une fois)
             out = pd.DataFrame({
-                "filename": pd.to_numeric(chunk["plant"], errors="coerce").astype("Int64").map(index_to_filename),
+                "name": pd.to_numeric(chunk["plant"], errors="coerce").astype("Int64").map(index_to_filename),
                 "channel": chunk["channel"],
                 "Y1": pd.to_numeric(chunk["Y1"], errors="coerce"),
                 "Y2": pd.to_numeric(chunk["Y2"], errors="coerce"),
@@ -238,8 +234,8 @@ def build_labels_stream(
 
     return output_path
 
-files = ["M1/channel_1.csv", "M1/channel_2.csv", "M1/channel_3.csv", "M1/channel_4.csv"]
-build_labels_stream(ROOT, files, output_filename="M1_labels_stream.csv", raw_folder= folder_M2)
+#files = ["M1/channel_1.csv", "M1/channel_2.csv", "M1/channel_3.csv", "M1/channel_4.csv"]
+#build_labels_stream(ROOT, files, output_filename="M1_labels_stream.csv", raw_folder= folder_M2)
 """
 def extract_features(ROOT,tsfresh_df, label):
     extracted_features = extract_relevant_features(df_ts_train_b, y_train, column_id="id", column_sort="time")
@@ -257,6 +253,7 @@ def get_signal(raw_dict, filename, channel):
 def convert_label(
     ROOT,
     input_filename,
+    input_filename2,
     output_filename,
     chunksize=5000,
     overwrite=True,
@@ -270,25 +267,25 @@ def convert_label(
     Returns: absolute output path.
     """
     LABEL_DIR = os.path.normpath(os.path.join(ROOT, "..", "Data", "label"))
-    input_path = os.path.join(LABEL_DIR, input_filename)
+    tsf_path = os.path.join(LABEL_DIR, input_filename)
+    cluster_path = os.path.join(LABEL_DIR, input_filename2)
     output_path = os.path.join(LABEL_DIR, output_filename)
 
+    cluster = pd.read_csv(cluster_path, sep=",")
+    # Select the columns needed for the merge
+    cluster_sel = cluster[["name", "Maincluster"]]
     if overwrite and os.path.exists(output_path):
         os.remove(output_path)
 
     header_written = False
-    for chunk in pd.read_csv(
-        input_path,
+    for tsf in pd.read_csv(
+        tsf_path,
         sep=";",
         chunksize=chunksize,
     ):
-        y1_num = pd.to_numeric(chunk.get("Y1"), errors="coerce")
-        y2_num = pd.to_numeric(chunk.get("Y2"), errors="coerce")
+        merge_df = tsf.merge(cluster_sel, how="right",on="name")
 
-        # Build per-row vector [Y1, Y2]
-        chunk["Y"] = [[a, b] for a, b in zip(y1_num, y2_num)]
-
-        chunk.to_csv(
+        merge_df.to_csv(
             output_path,
             sep=";",
             index=False,
@@ -299,125 +296,156 @@ def convert_label(
 
     return output_path
 
-input_filename = "M1_labels_stream.csv"
-output_filename = "M1_labels_converted.csv"
-convert_label(ROOT, input_filename, output_filename, chunksize=5000, overwrite=True)
+#input_filename = "M1_labels_stream.csv"
+#input_filename2 = "Cluster_MF_M1_names.csv"
+#output_filename = "M1_ready.csv"
+#convert_label(ROOT, input_filename, input_filename2, output_filename, chunksize=5000, overwrite=True)
 # leakage-safe tsfresh pipeline
+import os
+import numpy as np
+import pandas as pd
+from collections import defaultdict
+from sklearn.model_selection import train_test_split
+
+from tsfresh import extract_features, select_features
+from tsfresh.utilities.dataframe_functions import impute
+
+
 def prepare_tsfresh_train_test(
     ROOT,
     tsfresh_path,
     labels_path,
-    target_col="Y",
+    target_col="Maincluster",
     test_size=0.2,
     random_state=42,
     use_relevant_features=True,
     fdr_level=0.05,
     n_jobs=0,
-    disable_progressbar=True,
+    disable_progressbar=False,
+    chunksize=50000,
 ):
     """
-    Prepare leakage-safe train/test sets from long-form tsfresh input and labels.
+    Leakage-safe, memory-safe tsfresh pipeline with chunked CSV reading.
 
-    Steps:
-    - Split by unique `id` (each id = one sample, e.g., filename_channel)
-    - Extract features separately for train and test from long data
-    - Impute features
-    - Optionally select relevant features on TRAIN only, then align TEST columns
-
-    Returns: (X_train_sel, X_test_sel, y_train, y_test)
+    - Chunked reading of long-form time series
+    - Strict intersection of ids between signals and labels
+    - Train/test split done ON IDS ONLY (before reading signals)
+    - tsfresh feature extraction on full series per id only
     """
-    if extract_features is None or select_features is None or impute is None:
-        raise ImportError(
-            "tsfresh is not installed. Please install it: pip install tsfresh"
-        )
-    DATA = os.path.join(ROOT, "..", "Data")
-    DATA = os.path.normpath(DATA)
-
+    DATA = os.path.normpath(os.path.join(ROOT, "..", "Data"))
     tsfresh_csv_path = os.path.join(DATA, tsfresh_path)
     labels_csv_path = os.path.join(DATA, labels_path)
-    long_df = pd.read_csv(tsfresh_csv_path, sep=";")
+
+    #load labels 
     labels_df = pd.read_csv(labels_csv_path, sep=";")
 
-    # Build id to match tsfresh ids: filename + '_' + channel
     if "id" not in labels_df.columns:
-        if not {"filename", "channel"}.issubset(labels_df.columns):
-            raise ValueError("labels_csv must contain either 'id' or both 'filename' and 'channel'")
-        labels_df["id"] = labels_df["filename"].astype(str) + "_" + labels_df["channel"].astype(str)
+        if not {"name", "channel"}.issubset(labels_df.columns):
+            raise ValueError("labels file must contain 'id' or ('name','channel')")
+        labels_df["id"] = (
+            labels_df["name"].astype(str) + "_" + labels_df["channel"].astype(str)
+        )
 
     if target_col not in labels_df.columns:
-        raise ValueError(f"Target column '{target_col}' not found in labels CSV")
+        raise ValueError(f"Target column '{target_col}' not found")
 
-    # Keep only ids present in long_df
-    present_ids = set(long_df["id"].unique())
-    labels_df = labels_df[labels_df["id"].isin(present_ids)].copy()
     labels_df = labels_df.dropna(subset=[target_col])
 
-    ids = labels_df["id"].unique()
-    # No stratification by default to keep it robust
+    label_ids = set(labels_df["id"])
+
+    if len(label_ids) == 0:
+        raise ValueError("No valid labeled ids")
+
+    # Train/Test split
+    all_ids = np.array(sorted(label_ids)) # based on labelled id
+
     train_ids, test_ids = train_test_split(
-        ids, test_size=test_size, random_state=random_state
+        all_ids, test_size=test_size, random_state=random_state
     )
 
-    train_long = long_df[long_df["id"].isin(train_ids)].copy()
-    test_long = long_df[long_df["id"].isin(test_ids)].copy()
+    train_ids = set(train_ids)
+    test_ids = set(test_ids)
 
-    # Extract features separately to avoid any leakage
-    X_train = extract_features(
-        train_long,
-        column_id="id",
-        column_sort="time",
-        column_value="value",
-        disable_progressbar=disable_progressbar,
-        n_jobs=n_jobs,
-    ) 
-    X_test = extract_features(
-        test_long,
-        column_id="id",
-        column_sort="time",
-        column_value="value",
-        disable_progressbar=disable_progressbar,
-        n_jobs=n_jobs,
-    )
+    # Stream tsfresh CSV by chunks, group full series per id
+    train_buffers = defaultdict(list)
+    test_buffers = defaultdict(list)
+    
+    # Progression
+    n_lines = sum(1 for _ in open(tsfresh_csv_path)) - 1  # -1 pour l’en-tête
+    n_chunks = (n_lines // chunksize) + 1
+    
+    for chunk in tqdm(pd.read_csv(tsfresh_csv_path, sep=";", chunksize=chunksize),total=n_chunks,desc="Reading tsfresh chunks"):
+        # keep only ids that have labels
+        chunk = chunk[chunk["id"].isin(label_ids)]
 
-    # Impute missing values
-    impute(X_train)
-    impute(X_test)
+        for id_, sub in chunk.groupby("id", sort=False):
+            if id_ in train_ids:
+                train_buffers[id_].append(sub)
+            elif id_ in test_ids:
+                test_buffers[id_].append(sub)
 
-    # Align labels to indices
+    if len(train_buffers) == 0 or len(test_buffers) == 0:
+        raise ValueError("Empty train or test buffer after chunk processing")
+
+    # Helper: extract tsfresh features from buffered ids
+    def extract_from_buffers(buffers):
+        # One concat per id → ensures full time series
+        dfs = [pd.concat(parts, ignore_index=True) for parts in buffers.values()]
+        long_df = pd.concat(dfs, ignore_index=True)
+
+        X = extract_features(
+            long_df,
+            column_id="id",
+            column_sort="time",
+            column_value="value",
+            disable_progressbar=disable_progressbar,
+            n_jobs=n_jobs
+        )
+
+        impute(X)
+        return X
+
+    # Feature extraction
+    X_train = extract_from_buffers(train_buffers)
+    print(X_train)
+    X_test = extract_from_buffers(test_buffers)
+    print(X_test)
+    # Labels aligned to extracted features
     y_map = labels_df.set_index("id")[target_col]
-    y_train = y_map.reindex(X_train.index)
-    y_test = y_map.reindex(X_test.index)
 
-    # Optional supervised selection on the training set only
+    y_train = y_map.reindex(X_train.index)
+    print(y_train)
+    y_test = y_map.reindex(X_test.index)
+    print(y_test)
+
+    if y_train.isna().any() or y_test.isna().any():
+        raise RuntimeError("NaN detected in labels after alignment")
+
+    # Supervised feature selection (TRAIN ONLY)
     if use_relevant_features:
         X_train_sel = select_features(X_train, y_train, fdr_level=fdr_level)
-        selected_cols = X_train_sel.columns
-        # Ensure test has same columns (fill missing with 0 if any)
-        X_test_sel = X_test.reindex(columns=selected_cols, fill_value=0)
+        X_test_sel = X_test.reindex(columns=X_train_sel.columns, fill_value=0)
     else:
         X_train_sel, X_test_sel = X_train, X_test
-    # mettre sous csv
+    
+    print(X_train_sel.index)  # doit afficher les id type MF08Q2EP2_I22_087.fsa_channel_2
+    print(X_train_sel.columns)
+
+    def append_csv(df, path):
+        df.to_csv(
+            path,
+            mode="a",
+            index=True,
+            header=not os.path.exists(path)  # write header only if file doesn't exist
+        )
+
+    append_csv(X_train_sel, os.path.join(DATA, "X_train.csv"))
+    append_csv(X_test_sel,  os.path.join(DATA, "X_test.csv"))
+    append_csv(y_train,     os.path.join(DATA, "y_train.csv"))
+    append_csv(y_test,      os.path.join(DATA, "y_test.csv"))
+
     return X_train_sel, X_test_sel, y_train, y_test
-tsfresh_path = "M1_raw_tsfresh.csv"
-labels_path = "label/M1_labels_converted.csv"
-prepare_tsfresh_train_test(ROOT,
-    tsfresh_path,
-    labels_path,
-    target_col="Y",
-    test_size=0.2,
-    random_state=42,
-    use_relevant_features=True,
-    fdr_level=0.05,
-    n_jobs=0,
-    disable_progressbar=True,
-)
 
 
-
-# Main
-# def main()
-    DATA = os.path.join(ROOT, "..", "Data")
-    DATA = os.path.normpath(DATA)
-    PATH = os.path.join(DATA, folder_path)
-# argpase
-"""
+#tsfresh_path = "M1_raw_tsfresh.csv"
+#labels_path = "label/MF_M1_label.csv"
