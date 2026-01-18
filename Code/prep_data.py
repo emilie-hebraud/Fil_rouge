@@ -72,7 +72,7 @@ def prep_tsfresh(
     filename,
     write_tsfresh=True,
     tsfresh_filename=None,
-    save_raw_dict=False,
+    save_raw_dict=True,
 ):
     """
     Lit le CSV en chunks et retourne un dictionnaire `raw_dict` mappant
@@ -87,7 +87,7 @@ def prep_tsfresh(
 
     Retourne: (raw_dict, tsfresh_csv_path | None)
     """
-    DATA = os.path.join(ROOT, "..", "Data")
+    DATA = os.path.join(ROOT, "..", "Source")
     DATA = os.path.normpath(DATA)
 
     result_path = os.path.join(DATA, filename)
@@ -154,8 +154,8 @@ def prep_tsfresh(
 
     return raw_dict, tsfresh_path
 
-#filename = "M1_raw.csv"
-#prep_tsfresh(ROOT,filename,write_tsfresh=False,tsfresh_filename=None,save_raw_dict=True)
+filename = "M1_raw.csv"
+prep_tsfresh(ROOT,filename,write_tsfresh=False,tsfresh_filename=None,save_raw_dict=True)
 
 def build_labels_stream(
         ROOT,
