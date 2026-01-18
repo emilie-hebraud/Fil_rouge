@@ -53,7 +53,7 @@ def raw_data(PATH, folder_path, folder_name, overwrite=True):
         }
 
         raw_df = pd.DataFrame(channels)
-        raw_df.insert(0, "filename", filename)
+        raw_df.insert(0, "name", filename)
         raw_df.to_csv(
             result_path,
             sep=";",
@@ -118,8 +118,8 @@ def prep_tsfresh(
     header_written = False
 
     for chunk in pd.read_csv(result_path, sep=";", chunksize=5000):
-        for name, df_sub in chunk.groupby("filename"):
-            df = df_sub.drop(columns=["filename"]).reset_index(drop=True)
+        for name, df_sub in chunk.groupby("name"):
+            df = df_sub.drop(columns=["name"]).reset_index(drop=True)
             # Accumulation en mémoire du brut par fichier (si souhaité ensuite)
             if name not in raw_dict:
                 raw_dict[name] = df.copy()
@@ -301,15 +301,6 @@ def convert_label(
 #output_filename = "M1_ready.csv"
 #convert_label(ROOT, input_filename, input_filename2, output_filename, chunksize=5000, overwrite=True)
 # leakage-safe tsfresh pipeline
-import os
-import numpy as np
-import pandas as pd
-from collections import defaultdict
-from sklearn.model_selection import train_test_split
-
-from tsfresh import extract_features, select_features
-from tsfresh.utilities.dataframe_functions import impute
-
 
 def prepare_tsfresh_train_test(
     ROOT,
@@ -405,18 +396,25 @@ def prepare_tsfresh_train_test(
         impute(X)
         return X
 
+    def append_csv(df, path):
+        df.to_csv(
+            path,
+            mode="a",
+            index=True,
+            header=not os.path.exists(path)  # write header only if file doesn't exist
+        )
+
     # Feature extraction
     X_train = extract_from_buffers(train_buffers)
-    print(X_train)
     X_test = extract_from_buffers(test_buffers)
-    print(X_test)
+    append_csv(X_train, os.path.join(DATA, "X_train_ext.csv"))
+    append_csv(X_test,  os.path.join(DATA, "X_test_ext.csv"))
+    
     # Labels aligned to extracted features
     y_map = labels_df.set_index("id")[target_col]
 
     y_train = y_map.reindex(X_train.index)
-    print(y_train)
     y_test = y_map.reindex(X_test.index)
-    print(y_test)
 
     if y_train.isna().any() or y_test.isna().any():
         raise RuntimeError("NaN detected in labels after alignment")
@@ -428,19 +426,12 @@ def prepare_tsfresh_train_test(
     else:
         X_train_sel, X_test_sel = X_train, X_test
     
-    print(X_train_sel.index)  # doit afficher les id type MF08Q2EP2_I22_087.fsa_channel_2
+    #print(X_train_sel.index)  # doit afficher les id type MF08Q2EP2_I22_087.fsa_channel_2
     print(X_train_sel.columns)
 
-    def append_csv(df, path):
-        df.to_csv(
-            path,
-            mode="a",
-            index=True,
-            header=not os.path.exists(path)  # write header only if file doesn't exist
-        )
 
-    append_csv(X_train_sel, os.path.join(DATA, "X_train.csv"))
-    append_csv(X_test_sel,  os.path.join(DATA, "X_test.csv"))
+    append_csv(X_train_sel, os.path.join(DATA, "X_train_sel.csv"))
+    append_csv(X_test_sel,  os.path.join(DATA, "X_test_sel.csv"))
     append_csv(y_train,     os.path.join(DATA, "y_train.csv"))
     append_csv(y_test,      os.path.join(DATA, "y_test.csv"))
 
