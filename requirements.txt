@@ -4,3 +4,7 @@ numpy
 scikit-learn
 tsfresh
 tqdm
+torch
+torchvision
+torchaudio
+matplotlib
